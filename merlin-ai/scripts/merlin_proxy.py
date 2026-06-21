@@ -30,11 +30,104 @@ MODELS_CDN_URL = "https://cdn.jsdelivr.net/gh/foyer-work/cdn-files@latest/merlin
 
 GOOGLE_API_KEY = "AIzaSyAvCgtQ4XbmlQGIynDT-v_M8eLaXrKmtiM"
 
-# Token cache
+# Token cache (memory + disk for cross-restart persistence)
 _token_cache = {"token": None, "expires_at": 0, "lock": threading.Lock()}
 TOKEN_LIFETIME = 55 * 60  # Firebase tokens valid 1h
+TOKEN_DISK_PATH = os.environ.get("MERLIN_TOKEN_CACHE", "/tmp/merlin_token.json")
+
+# Rate-limit backoff: if Firebase returns TOO_MANY_ATTEMPTS_TRY_LATER, hold off
+# for RATE_LIMIT_COOLDOWN seconds before retrying. Persisted to disk so a
+# restart can't bypass the cooldown and re-trigger the rate limit.
+RATE_LIMIT_COOLDOWN = int(os.environ.get("MERLIN_RATE_LIMIT_COOLDOWN", "300"))  # 5 min default
+_rate_limit = {"locked_until": 0, "lock": threading.Lock()}
+RATE_LIMIT_DISK_PATH = TOKEN_DISK_PATH + ".ratelimit"
 MODEL_CACHE = {"models": None, "expires_at": 0, "lock": threading.Lock()}
 MODEL_CACHE_TTL = 300
+
+
+def _load_cached_token():
+    """Load persisted token from disk if still valid."""
+    try:
+        with open(TOKEN_DISK_PATH, "r") as f:
+            data = json.load(f)
+        if data.get("token") and data.get("expires_at", 0) > time.time():
+            return data
+    except (FileNotFoundError, json.JSONDecodeError, KeyError):
+        pass
+    return None
+
+
+def _save_cached_token(token, expires_at):
+    """Persist token to disk for next restart."""
+    try:
+        with open(TOKEN_DISK_PATH, "w") as f:
+            json.dump({"token": token, "expires_at": expires_at}, f)
+        os.chmod(TOKEN_DISK_PATH, 0o600)
+    except OSError as e:
+        print(f"[merlin_proxy] Warning: could not persist token to {TOKEN_DISK_PATH}: {e}", file=sys.stderr)
+
+
+def _load_rate_limit_state():
+    """Load rate-limit cooldown from disk (survives restarts)."""
+    try:
+        with open(RATE_LIMIT_DISK_PATH, "r") as f:
+            data = json.load(f)
+        return float(data.get("locked_until", 0))
+    except (FileNotFoundError, json.JSONDecodeError, ValueError, OSError):
+        return 0.0
+
+
+def _save_rate_limit_state(locked_until):
+    """Persist rate-limit cooldown to disk."""
+    try:
+        with open(RATE_LIMIT_DISK_PATH, "w") as f:
+            json.dump({"locked_until": locked_until}, f)
+        os.chmod(RATE_LIMIT_DISK_PATH, 0o600)
+    except OSError as e:
+        print(f"[merlin_proxy] Warning: could not persist rate-limit state: {e}", file=sys.stderr)
+
+
+class RateLimitedError(Exception):
+    """Raised when Firebase is rate-limiting us; caller should back off."""
+
+    def __init__(self, retry_after):
+        super().__init__(f"Firebase rate limit active; retry in {int(retry_after)}s")
+        self.retry_after = retry_after
+
+
+def _check_rate_limit():
+    """If we are inside a Firebase rate-limit cooldown, raise RateLimitedError."""
+    with _rate_limit["lock"]:
+        now = time.time()
+        locked_until = max(_rate_limit["locked_until"], _load_rate_limit_state())
+        _rate_limit["locked_until"] = locked_until
+        if now < locked_until:
+            raise RateLimitedError(locked_until - now)
+
+
+def _mark_rate_limited():
+    """Record that Firebase rate-limited us. Cooldown starts NOW + RATE_LIMIT_COOLDOWN."""
+    with _rate_limit["lock"]:
+        locked_until = time.time() + RATE_LIMIT_COOLDOWN
+        _rate_limit["locked_until"] = locked_until
+        _save_rate_limit_state(locked_until)
+        print(
+            f"[merlin_proxy] Firebase rate-limited; cooldown for {RATE_LIMIT_COOLDOWN}s "
+            f"until {time.strftime('%H:%M:%S', time.localtime(locked_until))}",
+            file=sys.stderr,
+        )
+
+
+def _clear_rate_limit():
+    """Clear rate-limit cooldown (called on successful login)."""
+    with _rate_limit["lock"]:
+        _rate_limit["locked_until"] = 0
+        try:
+            os.remove(RATE_LIMIT_DISK_PATH)
+        except FileNotFoundError:
+            pass
+        except OSError as e:
+            print(f"[merlin_proxy] Warning: could not clear rate-limit file: {e}", file=sys.stderr)
 
 
 def fetch_models():
@@ -63,6 +156,22 @@ def get_firebase_token():
         if _token_cache["token"] and now < _token_cache["expires_at"]:
             return _token_cache["token"]
 
+    # Check rate limit (acquires its own lock, so call outside the token lock)
+    _check_rate_limit()
+
+    with _token_cache["lock"]:
+        # Re-check token cache (another thread may have refreshed it)
+        now = time.time()
+        if _token_cache["token"] and now < _token_cache["expires_at"]:
+            return _token_cache["token"]
+
+        # Try disk cache first (survives restarts, avoids Firebase rate limits)
+        disk = _load_cached_token()
+        if disk:
+            _token_cache["token"] = disk["token"]
+            _token_cache["expires_at"] = disk["expires_at"]
+            return _token_cache["token"]
+
         url = f"{FIREBASE_LOGIN_URL}?key={GOOGLE_API_KEY}"
         body = json.dumps({
             "email": email,
@@ -86,10 +195,15 @@ def get_firebase_token():
                 print(f"[merlin_proxy] Logged in as {email} (plan: {plan})", file=sys.stderr)
                 _token_cache["token"] = token
                 _token_cache["expires_at"] = now + TOKEN_LIFETIME
+                _save_cached_token(token, _token_cache["expires_at"])
+                _clear_rate_limit()
                 return token
         except urllib.error.HTTPError as e:
             err_body = e.read().decode()
             print(f"[merlin_proxy] Firebase login error: {e.code} {err_body[:300]}", file=sys.stderr)
+            if e.code == 400 and "TOO_MANY_ATTEMPTS_TRY_LATER" in err_body:
+                _mark_rate_limited()
+                raise RateLimitedError(RATE_LIMIT_COOLDOWN) from e
             raise
 
 
@@ -317,6 +431,18 @@ class MerlinProxyHandler(http.server.BaseHTTPRequestHandler):
                     }
                     self._send_json(200, openai_resp)
 
+        except RateLimitedError as e:
+            retry_after = int(e.retry_after) + 1
+            self.send_response(503)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Retry-After", str(retry_after))
+            self.end_headers()
+            self.wfile.write(json.dumps({
+                "error": "Firebase rate-limited; login is in cooldown",
+                "detail": str(e),
+                "retry_after_seconds": retry_after,
+            }).encode())
+            print(f"[merlin_proxy] 503: rate limit cooldown ({retry_after}s remaining)", file=sys.stderr)
         except ValueError as e:
             self._send_json(500, {"error": str(e)})
         except urllib.error.HTTPError as e:
